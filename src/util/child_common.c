@@ -521,6 +521,118 @@ int read_pipe_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
     return EOK;
 }
 
+//////////////////////////////////////////////////////////////////////////////
+struct read_pdu_state {
+    int fd;
+    uint8_t *buf;
+    size_t len;
+    size_t pdu_len;
+};
+
+static void read_pdu_handler(struct tevent_context *ev,
+                             struct tevent_fd *fde,
+                             uint16_t flags, void *pvt);
+
+struct tevent_req *read_pdu_send(TALLOC_CTX *mem_ctx,
+                                 struct tevent_context *ev, int fd, size_t pdu_len)
+{
+    struct tevent_req *req;
+    struct read_pdu_state *state;
+    struct tevent_fd *fde;
+
+    req = tevent_req_create(mem_ctx, &state, struct read_pdu_state);
+    if (req == NULL) return NULL;
+
+    state->fd = fd;
+    state->len = 0;
+    state->pdu_len = pdu_len;
+
+    if (pdu_len==0) {
+      state->buf = NULL;
+      tevent_req_done(req);
+      return req;
+    }
+    
+    state->buf = talloc_array(state, uint8_t, pdu_len);
+    if (!state->buf) {
+      goto fail;
+    }
+
+    fde = tevent_add_fd(ev, state, fd, TEVENT_FD_READ,
+                        read_pdu_handler, req);
+    if (fde == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "tevent_add_fd failed.\n");
+        goto fail;
+    }
+
+    return req;
+
+fail:
+    talloc_zfree(req);
+    return NULL;
+}
+
+static void read_pdu_handler(struct tevent_context *ev,
+                              struct tevent_fd *fde,
+                              uint16_t flags, void *pvt)
+{
+    struct tevent_req *req = talloc_get_type(pvt, struct tevent_req);
+    struct read_pdu_state *state = tevent_req_data(req,
+                                                    struct read_pdu_state);
+    ssize_t size;
+    errno_t err;
+
+    if (flags & TEVENT_FD_WRITE) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "read_pdu_done called with TEVENT_FD_WRITE,"
+                  " this should not happen.\n");
+        tevent_req_error(req, EINVAL);
+        return;
+    }
+
+    size = sss_atomic_read_s(state->fd,
+			     state->buf + state->len,
+			     state->pdu_len - state->len);
+    if (size == -1) {
+        err = errno;
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "read failed [%d][%s].\n", err, strerror(err));
+        tevent_req_error(req, err);
+        return;
+
+    } else if (size > 0) {
+      state->len += size;
+      if (state->len == state->pdu_len) {
+        DEBUG(SSSDBG_TRACE_FUNC, "PDU received\n");
+        tevent_req_done(req);
+      }
+      return;
+    } else if (size == 0) {
+        DEBUG(SSSDBG_TRACE_FUNC, "EOF received before PDU complete\n");
+        tevent_req_error(req, EPIPE);
+        return;
+    } else {
+        DEBUG(SSSDBG_CRIT_FAILURE,
+              "unexpected return value of read [%zd].\n", size);
+        tevent_req_error(req, EINVAL);
+        return;
+    }
+}
+
+int read_pdu_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
+                   uint8_t **buf, ssize_t *len)
+{
+    struct read_pdu_state *state;
+    state = tevent_req_data(req, struct read_pdu_state);
+
+    TEVENT_REQ_RETURN_ON_ERROR(req);
+
+    *buf = talloc_steal(mem_ctx, state->buf);
+    if (len) *len = state->len;
+
+    return EOK;
+}
+
+//////////////////////////////////////////////////////////////////////////////
 static void child_invoke_callback(struct tevent_context *ev,
                                   struct tevent_immediate *imm,
                                   void *pvt);

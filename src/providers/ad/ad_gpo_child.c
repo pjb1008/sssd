@@ -651,34 +651,16 @@ copy_smb_file_to_gpo_cache(SMBCCTX *smbc_ctx,
  * - backend will read the policy file from the GPO_CACHE
  */
 static errno_t
-perform_smb_operations(int cached_gpt_version,
+perform_smb_operations(SMBCCTX *smbc_ctx,
+		       int cached_gpt_version,
                        const char *smb_server,
                        const char *smb_share,
                        const char *smb_path,
                        const char *smb_cse_suffix,
                        int *_sysvol_gpt_version)
 {
-    SMBCCTX *smbc_ctx;
     int ret;
     int sysvol_gpt_version;
-
-    smbc_ctx = smbc_new_context();
-    if (smbc_ctx == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Could not allocate new smbc context\n");
-        ret = ENOMEM;
-        goto done;
-    }
-
-    smbc_setOptionDebugToStderr(smbc_ctx, 1);
-    smbc_setFunctionAuthData(smbc_ctx, sssd_krb_get_auth_data_fn);
-    smbc_setOptionUseKerberos(smbc_ctx, 1);
-
-    /* Initialize the context using the previously specified options */
-    if (smbc_init_context(smbc_ctx) == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Could not initialize smbc context\n");
-        ret = ENOMEM;
-        goto done;
-    }
 
     /* download ini file */
     ret = copy_smb_file_to_gpo_cache(smbc_ctx, smb_server, smb_share, smb_path,
@@ -714,7 +696,6 @@ perform_smb_operations(int cached_gpt_version,
     *_sysvol_gpt_version = sysvol_gpt_version;
 
  done:
-    smbc_free_context(smbc_ctx, 0);
     return ret;
 }
 
@@ -734,7 +715,8 @@ main(int argc, const char *argv[])
     struct input_buffer *ibuf = NULL;
     struct response *resp = NULL;
     ssize_t written;
-
+    SMBCCTX *smbc_ctx = NULL;
+    
     struct poptOption long_options[] = {
         POPT_AUTOHELP
         SSSD_DEBUG_OPTS
@@ -786,75 +768,116 @@ main(int argc, const char *argv[])
         goto fail;
     }
     talloc_steal(main_ctx, debug_prg_name);
+    DEBUG(SSSDBG_TRACE_FUNC, "ready to read from parent\n");
 
-    buf = talloc_size(main_ctx, sizeof(uint8_t)*IN_BUF_SIZE);
-    if (buf == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "talloc_size failed.\n");
+    smbc_ctx = smbc_new_context();
+    if (smbc_ctx == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Could not allocate new smbc context\n");
         goto fail;
     }
 
-    ibuf = talloc_zero(main_ctx, struct input_buffer);
-    if (ibuf == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "talloc_zero failed.\n");
+    smbc_setOptionDebugToStderr(smbc_ctx, 1);
+    smbc_setFunctionAuthData(smbc_ctx, sssd_krb_get_auth_data_fn);
+    smbc_setOptionUseKerberos(smbc_ctx, 1);
+
+    /* Initialize the context using the previously specified options */
+    if (smbc_init_context(smbc_ctx) == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "Could not initialize smbc context\n");
         goto fail;
+    }    
+
+    while (true) {
+
+      errno = 0;
+      uint32_t size;
+      len = sss_atomic_read_s(STDIN_FILENO, &size, sizeof(uint32_t));
+      if (len == -1) {
+	  ret = errno;
+	  DEBUG(SSSDBG_CRIT_FAILURE, "read failed (buffer header) [%d][%s].\n", ret, strerror(ret));
+	  goto fail;
+      }
+      DEBUG(SSSDBG_TRACE_FUNC, "buffer length read\n");
+
+      if (size > 8192) {
+          DEBUG(SSSDBG_CRIT_FAILURE, "buffer length implausible 0x%04x.\n", (unsigned int)size);
+	  goto fail;
+      }
+      buf = talloc_size(main_ctx, sizeof(uint8_t)*IN_BUF_SIZE);
+      if (buf == NULL) {
+          DEBUG(SSSDBG_CRIT_FAILURE, "talloc_size failed.\n");
+          goto fail;
+      }
+
+      ibuf = talloc_zero(main_ctx, struct input_buffer);
+      if (ibuf == NULL) {
+	  DEBUG(SSSDBG_CRIT_FAILURE, "talloc_zero failed.\n");
+	  goto fail;
+      }
+      DEBUG(SSSDBG_TRACE_FUNC, "buffer read\n");
+
+      errno = 0;
+      len = sss_atomic_read_s(STDIN_FILENO, buf, size);
+      if (len == -1) {
+	  ret = errno;
+	  DEBUG(SSSDBG_CRIT_FAILURE, "read failed (buffer data) [%d][%s].\n", ret, strerror(ret));
+	  goto fail;
+      }
+
+      /* End of input reached */
+      if (len == 0)
+	break; 
+
+      ret = unpack_buffer(buf, len, ibuf);
+      if (ret != EOK) {
+	  DEBUG(SSSDBG_CRIT_FAILURE,
+		"unpack_buffer failed.[%d][%s].\n", ret, strerror(ret));
+	  goto fail;
+      }
+
+      DEBUG(SSSDBG_TRACE_FUNC, "performing smb operations\n");
+
+      result = perform_smb_operations(smbc_ctx,
+				      ibuf->cached_gpt_version,
+				      ibuf->smb_server,
+				      ibuf->smb_share,
+				      ibuf->smb_path,
+				      ibuf->smb_cse_suffix,
+				      &sysvol_gpt_version);
+      if (result != EOK) {
+	  DEBUG(SSSDBG_CRIT_FAILURE,
+		"perform_smb_operations failed.[%d][%s].\n",
+		result, strerror(result));
+	  goto fail;
+      }
+
+      ret = prepare_response(main_ctx, sysvol_gpt_version, result, &resp);
+      if (ret != EOK) {
+	  DEBUG(SSSDBG_CRIT_FAILURE, "prepare_response failed. [%d][%s].\n",
+		      ret, strerror(ret));
+	  goto fail;
+      }
+
+      errno = 0;
+
+      written = sss_atomic_write_s(AD_GPO_CHILD_OUT_FILENO, resp->buf, resp->size);
+      if (written == -1) {
+	  ret = errno;
+	  DEBUG(SSSDBG_CRIT_FAILURE, "write failed [%d][%s].\n", ret,
+		      strerror(ret));
+	  goto fail;
+      }
+
+      if (written != resp->size) {
+	  DEBUG(SSSDBG_CRIT_FAILURE, "Expected to write %zu bytes, wrote %zu\n",
+		resp->size, written);
+	  goto fail;
+      }
+
+      talloc_free(ibuf);
+      talloc_free(buf);
     }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "context initialized\n");
-
-    errno = 0;
-    len = sss_atomic_read_s(STDIN_FILENO, buf, IN_BUF_SIZE);
-    if (len == -1) {
-        ret = errno;
-        DEBUG(SSSDBG_CRIT_FAILURE, "read failed [%d][%s].\n", ret, strerror(ret));
-        goto fail;
-    }
-
-    close(STDIN_FILENO);
-
-    ret = unpack_buffer(buf, len, ibuf);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "unpack_buffer failed.[%d][%s].\n", ret, strerror(ret));
-        goto fail;
-    }
-
-    DEBUG(SSSDBG_TRACE_FUNC, "performing smb operations\n");
-
-    result = perform_smb_operations(ibuf->cached_gpt_version,
-                                    ibuf->smb_server,
-                                    ibuf->smb_share,
-                                    ibuf->smb_path,
-                                    ibuf->smb_cse_suffix,
-                                    &sysvol_gpt_version);
-    if (result != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE,
-              "perform_smb_operations failed.[%d][%s].\n",
-              result, strerror(result));
-        goto fail;
-    }
-
-    ret = prepare_response(main_ctx, sysvol_gpt_version, result, &resp);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "prepare_response failed. [%d][%s].\n",
-                    ret, strerror(ret));
-        goto fail;
-    }
-
-    errno = 0;
-
-    written = sss_atomic_write_s(AD_GPO_CHILD_OUT_FILENO, resp->buf, resp->size);
-    if (written == -1) {
-        ret = errno;
-        DEBUG(SSSDBG_CRIT_FAILURE, "write failed [%d][%s].\n", ret,
-                    strerror(ret));
-        goto fail;
-    }
-
-    if (written != resp->size) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "Expected to write %zu bytes, wrote %zu\n",
-              resp->size, written);
-        goto fail;
-    }
+    
+    smbc_free_context(smbc_ctx, 0);
 
     DEBUG(SSSDBG_TRACE_FUNC, "gpo_child completed successfully\n");
     close(AD_GPO_CHILD_OUT_FILENO);
@@ -863,6 +886,8 @@ main(int argc, const char *argv[])
 
 fail:
     DEBUG(SSSDBG_CRIT_FAILURE, "gpo_child failed!\n");
+    if (smbc_ctx)
+      smbc_free_context(smbc_ctx, 0);
     close(AD_GPO_CHILD_OUT_FILENO);
     talloc_free(main_ctx);
     return EXIT_FAILURE;

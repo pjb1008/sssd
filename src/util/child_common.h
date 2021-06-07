@@ -100,6 +100,17 @@ struct tevent_req *read_pipe_send(TALLOC_CTX *mem_ctx,
 int read_pipe_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
                    uint8_t **buf, ssize_t *len);
 
+/* Async communication with the child process via a pipe - fixed size data transfer */
+//struct tevent_req *write_pdu_send(TALLOC_CTX *mem_ctx,
+//                                   struct tevent_context *ev,
+//                                   uint8_t *buf, size_t len, int fd);
+//int write_pdu_recv(struct tevent_req *req);
+
+struct tevent_req *read_pdu_send(TALLOC_CTX *mem_ctx,
+                                  struct tevent_context *ev, int fd, size_t pdu_len);
+int read_pdu_recv(struct tevent_req *req, TALLOC_CTX *mem_ctx,
+                   uint8_t **buf, ssize_t *len);
+
 /* The pipes to communicate with the child must be nonblocking */
 void fd_nonblocking(int fd);
 

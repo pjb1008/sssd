@@ -180,7 +180,9 @@ struct tevent_req *ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
                                            const char *smb_path,
                                            const char *smb_cse_suffix,
                                            int cached_gpt_version,
-                                           int gpo_timeout_option);
+                                           int gpo_timeout_option,
+					   pid_t *child_pid,
+					   struct child_io_fds *io);
 
 int ad_gpo_process_cse_recv(struct tevent_req *req);
 
@@ -1781,6 +1783,8 @@ struct ad_gpo_access_state {
     int num_cse_filtered_gpos;
     int cse_gpo_index;
     const char *ad_domain;
+    struct child_io_fds *io;
+    pid_t child_pid;
 };
 
 static void ad_gpo_connect_done(struct tevent_req *subreq);
@@ -1903,7 +1907,19 @@ ad_gpo_access_send(TALLOC_CTX *mem_ctx,
         goto immediately;
     }
 
-
+    /* We may need a child process later in gpo_access, but we want one child process 
+       for the entire ad_gpo_access so initialize data structure here */
+    state->child_pid = 0;
+    state->io = talloc(state, struct child_io_fds);
+    if (state->io == NULL) {
+        DEBUG(SSSDBG_CRIT_FAILURE, "talloc failed.\n");
+        ret = ENOMEM;
+        goto immediately;
+    }
+    state->io->write_to_child_fd = -1;
+    state->io->read_from_child_fd = -1;
+    talloc_set_destructor((void *) state->io, child_io_destructor);
+    
     subreq = sdap_id_op_connect_send(state->sdap_op, state, &ret);
     if (subreq == NULL) {
         DEBUG(SSSDBG_OP_FAILURE,
@@ -2716,7 +2732,9 @@ ad_gpo_cse_step(struct tevent_req *req)
                                      cse_filtered_gpo->smb_path,
                                      GP_EXT_GUID_SECURITY_SUFFIX,
                                      cached_gpt_version,
-                                     state->gpo_timeout_option);
+                                     state->gpo_timeout_option,
+				     &state->child_pid,
+				     state->io);
 
     tevent_req_set_callback(subreq, ad_gpo_cse_done, req);
     return EAGAIN;
@@ -4496,7 +4514,7 @@ create_cse_send_buffer(TALLOC_CTX *mem_ctx,
                        struct io_buffer **io_buf)
 {
     struct io_buffer *buf;
-    size_t rp;
+    size_t rp, rp2;
     int smb_server_length;
     int smb_share_length;
     int smb_path_length;
@@ -4513,7 +4531,7 @@ create_cse_send_buffer(TALLOC_CTX *mem_ctx,
         return ENOMEM;
     }
 
-    buf->size = 5 * sizeof(uint32_t);
+    buf->size = 6 * sizeof(uint32_t);
     buf->size += smb_server_length + smb_share_length + smb_path_length +
         smb_cse_suffix_length;
 
@@ -4526,7 +4544,9 @@ create_cse_send_buffer(TALLOC_CTX *mem_ctx,
         return ENOMEM;
     }
 
-    rp = 0;
+    /* Reserve space for buffer size at start - will overwrite with correct value later */
+    rp = sizeof(uint32_t);
+
     /* cached_gpt_version */
     SAFEALIGN_SET_UINT32(&buf->data[rp], cached_gpt_version, &rp);
 
@@ -4545,6 +4565,10 @@ create_cse_send_buffer(TALLOC_CTX *mem_ctx,
     /* smb_cse_suffix */
     SAFEALIGN_SET_UINT32(&buf->data[rp], smb_cse_suffix_length, &rp);
     safealign_memcpy(&buf->data[rp], smb_cse_suffix, smb_cse_suffix_length, &rp);
+
+    /* Now fill in buffer size. Size indicates how many bytes follow this header. */
+    rp2 = 0; /* Not used */
+    SAFEALIGN_SET_UINT32(buf->data, rp - sizeof(uint32_t), &rp2);
 
     *io_buf = buf;
     return EOK;
@@ -4584,7 +4608,7 @@ struct ad_gpo_process_cse_state {
     const char *gpo_guid;
     const char *smb_path;
     const char *smb_cse_suffix;
-    pid_t child_pid;
+    pid_t *child_pid;
     uint8_t *buf;
     ssize_t len;
     struct child_io_fds *io;
@@ -4612,7 +4636,10 @@ ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
                         const char *smb_path,
                         const char *smb_cse_suffix,
                         int cached_gpt_version,
-                        int gpo_timeout_option)
+                        int gpo_timeout_option,
+			pid_t *child_pid,
+			struct child_io_fds *io
+			)
 {
     struct tevent_req *req;
     struct tevent_req *subreq;
@@ -4643,17 +4670,9 @@ ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
     state->gpo_guid = gpo_guid;
     state->smb_path = smb_path;
     state->smb_cse_suffix = smb_cse_suffix;
-    state->io = talloc(state, struct child_io_fds);
-    if (state->io == NULL) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "talloc failed.\n");
-        ret = ENOMEM;
-        goto immediately;
-    }
-
-    state->io->write_to_child_fd = -1;
-    state->io->read_from_child_fd = -1;
-    talloc_set_destructor((void *) state->io, child_io_destructor);
-
+    state->io = io;
+    state->child_pid = child_pid;
+    
     /* prepare the data to pass to child */
     ret = create_cse_send_buffer(state, smb_server, smb_share, smb_path,
                                  smb_cse_suffix, cached_gpt_version, &buf);
@@ -4662,10 +4681,12 @@ ad_gpo_process_cse_send(TALLOC_CTX *mem_ctx,
         goto immediately;
     }
 
-    ret = gpo_fork_child(req);
-    if (ret != EOK) {
-        DEBUG(SSSDBG_CRIT_FAILURE, "gpo_fork_child failed.\n");
-        goto immediately;
+    if (*state->child_pid == 0) {
+      ret = gpo_fork_child(req);
+      if (ret != EOK) {
+          DEBUG(SSSDBG_CRIT_FAILURE, "gpo_fork_child failed.\n");
+	  goto immediately;
+      }
     }
 
     subreq = write_pipe_send(state, ev, buf->data, buf->size,
@@ -4707,9 +4728,9 @@ static void gpo_cse_step(struct tevent_req *subreq)
         return;
     }
 
-    PIPE_FD_CLOSE(state->io->write_to_child_fd);
+    //    PIPE_FD_CLOSE(state->io->write_to_child_fd);
 
-    subreq = read_pipe_send(state, state->ev, state->io->read_from_child_fd);
+    subreq = read_pdu_send(state, state->ev, state->io->read_from_child_fd, 2*sizeof(int32_t));
 
     if (subreq == NULL) {
         tevent_req_error(req, ENOMEM);
@@ -4730,14 +4751,14 @@ static void gpo_cse_done(struct tevent_req *subreq)
     state = tevent_req_data(req, struct ad_gpo_process_cse_state);
     int ret;
 
-    ret = read_pipe_recv(subreq, state, &state->buf, &state->len);
+    ret = read_pdu_recv(subreq, state, &state->buf, &state->len);
     talloc_zfree(subreq);
     if (ret != EOK) {
         tevent_req_error(req, ret);
         return;
     }
 
-    PIPE_FD_CLOSE(state->io->read_from_child_fd);
+    //    PIPE_FD_CLOSE(state->io->read_from_child_fd);
 
     ret = ad_gpo_parse_gpo_child_response(state->buf, state->len,
                                           &sysvol_gpt_version, &child_result);
@@ -4813,7 +4834,7 @@ gpo_fork_child(struct tevent_req *req)
         /* We should never get here */
         DEBUG(SSSDBG_CRIT_FAILURE, "BUG: Could not exec gpo_child:\n");
     } else if (pid > 0) { /* parent */
-        state->child_pid = pid;
+        *state->child_pid = pid;
         state->io->read_from_child_fd = pipefd_from_child[0];
         PIPE_FD_CLOSE(pipefd_from_child[1]);
         state->io->write_to_child_fd = pipefd_to_child[1];
